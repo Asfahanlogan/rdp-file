@@ -12,90 +12,79 @@ jobs:
       - name: Configure Core RDP Settings
         shell: pwsh
         run: |
-          # Enable Remote Desktop (allow connections)
+          # Enable Remote Desktop
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name "fDenyTSConnections" -Value 0 -Force
 
-          # Optional: disable NLA if needed (0 = disabled). Change with caution.
+          # Optional: disable NLA (change if you need)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" -Value 0 -Force
 
-          # Firewall rule (allow incoming RDP on 3389)
+          # Firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no existing rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          # Restart service to apply changes
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User (secure: use secret or static fallback)
+      - name: Create RDP User (static password admin123)
         shell: pwsh
-        env:
-          # set USE_STATIC_PASSWORD=true if you want to force admin123 (not recommended)
-          USE_STATIC_PASSWORD: ${{ env.USE_STATIC_PASSWORD }}
         run: |
           $username = "RDP"
+          $plainPassword = "admin123"
 
-          # Choose password source:
-          # 1) Preferred: repository secret named RDP_PASSWORD
-          # 2) Fallback if you explicitly set USE_STATIC_PASSWORD to "true": admin123
-          $secretPass = $null
+          Write-Host "Creating/updating user $username with static password 'admin123'..."
+
           try {
-              $secretPass = "${{ secrets.RDP_PASSWORD }}"
-          } catch {
-              $secretPass = $null
-          }
-
-          if ($env:USE_STATIC_PASSWORD -and $env:USE_STATIC_PASSWORD.ToLower() -eq "true") {
-              Write-Host "Using static fallback password (admin123)."
-              $plainPassword = "admin123"
-          } elseif ($secretPass) {
-              $plainPassword = $secretPass
-              Write-Host "Using password from secret (not printed)."
-          } else {
-              Write-Error "No password source found. Set repository secret 'RDP_PASSWORD' or set USE_STATIC_PASSWORD=true (not recommended)."
-              exit 1
-          }
-
-          # Convert to SecureString for New-LocalUser/Set-LocalUser
-          try {
+              # Try using the modern cmdlet first
               $securePass = ConvertTo-SecureString $plainPassword -AsPlainText -Force
-          } catch {
-              Write-Error "Failed to convert password to SecureString: $_"
-              exit 1
-          }
 
-          try {
               if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
                   New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
-                  Add-LocalGroupMember -Group "Administrators" -Member $username
-                  Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-                  Write-Host "User $username created."
               } else {
                   # Update existing user's password
                   $user = Get-LocalUser -Name $username
                   $user | Set-LocalUser -Password $securePass -ErrorAction Stop
-                  Write-Host "Password for existing user $username updated."
-                  if (-not (Get-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue)) {
-                      Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-                  }
-                  if (-not (Get-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue)) {
-                      Add-LocalGroupMember -Group "Administrators" -Member $username
-                  }
               }
+
+              # Ensure group membership
+              if (-not (Get-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue)) {
+                  Add-LocalGroupMember -Group "Administrators" -Member $username
+              }
+              if (-not (Get-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue)) {
+                  Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+              }
+
+              Write-Host "User created/updated via New-LocalUser / Set-LocalUser."
           } catch [Microsoft.PowerShell.Commands.InvalidPasswordException] {
-              Write-Error "InvalidPasswordException: Password rejected by local policy. Use a stronger password (mix upper/lower/number/symbol, longer)."
-              exit 1
+              Write-Warning "New-LocalUser rejected the password (policy). Falling back to 'net user' approach."
+
+              # Fallback: try net user (may bypass some restrictions)
+              $exists = (net user $username) -match "The command completed successfully"
+              if ($exists) {
+                  # If exists, set password
+                  net user $username $plainPassword
+              } else {
+                  # Create user and set password
+                  net user $username $plainPassword /add
+              }
+
+              # Add to groups
+              net localgroup Administrators $username /add
+              net localgroup "Remote Desktop Users" $username /add
+
+              Write-Host "User created/updated via net user fallback."
           } catch {
-              Write-Error "Unexpected error while creating/updating user: $_"
+              Write-Error "Unexpected error creating/updating user: $_"
               exit 1
           }
 
-          # Export username and a hint that password is set (do NOT export the plain password)
+          # Export env values for later steps
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
-          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS_SOURCE=$((if ($env:USE_STATIC_PASSWORD -and $env:USE_STATIC_PASSWORD.ToLower() -eq 'true') {'static(admin123)'} else {'secret(RDP_PASSWORD)'}))"
+          # We will print the password below because you requested it
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=admin123"
 
       - name: Install Tailscale
         shell: pwsh
@@ -111,7 +100,6 @@ jobs:
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          # Wait for IPv4
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
@@ -138,13 +126,13 @@ jobs:
           }
           Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection (show info, don't print password)
+      - name: Maintain Connection (show creds)
         shell: pwsh
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:TAILSCALE_IP"
           Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password source: $env:RDP_PASS_SOURCE"
+          Write-Host "Password: admin123"
           Write-Host "==================`n"
 
           while ($true) {
